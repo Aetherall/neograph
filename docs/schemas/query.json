@@ -1,0 +1,150 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/neograph/query.json",
+  "title": "Neograph Query",
+  "description": "Query definition for a Neograph database",
+  "type": "object",
+  "required": ["root"],
+  "properties": {
+    "root": {
+      "type": "string",
+      "description": "Root type name to query"
+    },
+    "id": {
+      "type": "integer",
+      "description": "Direct node ID lookup (bypasses index-based query)"
+    },
+    "virtual": {
+      "type": "boolean",
+      "description": "If true, root nodes are not included in results (only their edge targets)",
+      "default": false
+    },
+    "sort": {
+      "type": "array",
+      "description": "Sort order for root-level results",
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/Sort"
+      }
+    },
+    "filter": {
+      "type": "array",
+      "description": "Filters for root-level results",
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/Filter"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Edge selections to include in results",
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/EdgeSelection"
+      }
+    }
+  },
+  "definitions": {
+    "Sort": {
+      "type": "object",
+      "description": "Sort specification",
+      "required": ["field"],
+      "properties": {
+        "field": {
+          "type": "string",
+          "description": "Field name to sort by"
+        },
+        "direction": {
+          "type": "string",
+          "description": "Sort direction",
+          "enum": ["asc", "desc"],
+          "default": "asc"
+        }
+      }
+    },
+    "Filter": {
+      "type": "object",
+      "description": "Filter specification",
+      "required": ["field"],
+      "properties": {
+        "field": {
+          "type": "string",
+          "description": "Field name to filter on"
+        },
+        "op": {
+          "type": "string",
+          "description": "Comparison operator",
+          "enum": ["eq", "neq", "gt", "gte", "lt", "lte", "in"],
+          "default": "eq"
+        },
+        "value": {
+          "description": "Value to compare against",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "number" },
+            { "type": "integer" },
+            { "type": "boolean" },
+            { "type": "null" },
+            {
+              "type": "array",
+              "description": "Array of values for 'in' operator",
+              "items": {
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "number" },
+                  { "type": "integer" },
+                  { "type": "boolean" }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    "EdgeSelection": {
+      "type": "object",
+      "description": "Edge traversal specification",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Edge name to traverse"
+        },
+        "recursive": {
+          "type": "boolean",
+          "description": "If true, recursively traverse this edge (for tree structures)",
+          "default": false
+        },
+        "virtual": {
+          "type": "boolean",
+          "description": "If true, targets are used for further traversal but not included in results",
+          "default": false
+        },
+        "sort": {
+          "type": "array",
+          "description": "Sort order for edge targets",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/Sort"
+          }
+        },
+        "filter": {
+          "type": "array",
+          "description": "Filters for edge targets",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/Filter"
+          }
+        },
+        "edges": {
+          "type": "array",
+          "description": "Nested edge selections",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/EdgeSelection"
+          }
+        }
+      }
+    }
+  }
+}

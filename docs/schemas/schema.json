@@ -1,0 +1,240 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/neograph/schema.json",
+  "title": "Neograph Schema",
+  "description": "Schema definition for a Neograph database",
+  "type": "object",
+  "required": ["types"],
+  "properties": {
+    "types": {
+      "type": "array",
+      "description": "List of type definitions",
+      "items": {
+        "$ref": "#/definitions/TypeDef"
+      }
+    }
+  },
+  "definitions": {
+    "TypeDef": {
+      "type": "object",
+      "description": "A node type definition",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Unique name for this type"
+        },
+        "properties": {
+          "type": "array",
+          "description": "Properties stored on nodes of this type",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/PropertyDef"
+          }
+        },
+        "edges": {
+          "type": "array",
+          "description": "Edges (relationships) from this type to other types",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/EdgeDef"
+          }
+        },
+        "indexes": {
+          "type": "array",
+          "description": "Indexes for efficient querying",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/IndexDef"
+          }
+        },
+        "rollups": {
+          "type": "array",
+          "description": "Computed fields derived from edges and properties",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/RollupDef"
+          }
+        }
+      }
+    },
+    "PropertyDef": {
+      "type": "object",
+      "description": "A property definition",
+      "required": ["name", "type"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Property name"
+        },
+        "type": {
+          "type": "string",
+          "description": "Property data type",
+          "enum": ["string", "int", "number", "bool"]
+        }
+      }
+    },
+    "EdgeDef": {
+      "type": "object",
+      "description": "An edge (relationship) definition. Edges are always bidirectional.",
+      "required": ["name", "target", "reverse"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Edge name (used to traverse from this type)"
+        },
+        "target": {
+          "type": "string",
+          "description": "Target type name"
+        },
+        "reverse": {
+          "type": "string",
+          "description": "Reverse edge name (on the target type)"
+        },
+        "sort": {
+          "$ref": "#/definitions/EdgeSortDef",
+          "description": "Optional sort specification for edge targets"
+        }
+      }
+    },
+    "EdgeSortDef": {
+      "type": "object",
+      "description": "Sort specification for edge targets. When defined, edge targets are stored sorted by the target's property value.",
+      "required": ["property"],
+      "properties": {
+        "property": {
+          "type": "string",
+          "description": "Property name on the target node to sort by"
+        },
+        "direction": {
+          "type": "string",
+          "description": "Sort direction",
+          "enum": ["asc", "desc"],
+          "default": "asc"
+        }
+      }
+    },
+    "IndexDef": {
+      "type": "object",
+      "description": "An index definition for efficient querying",
+      "required": ["fields"],
+      "properties": {
+        "fields": {
+          "type": "array",
+          "description": "Ordered list of fields to index",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/IndexField"
+          }
+        }
+      }
+    },
+    "IndexField": {
+      "type": "object",
+      "description": "A field within an index",
+      "required": ["field"],
+      "properties": {
+        "field": {
+          "type": "string",
+          "description": "Field name (property or edge name)"
+        },
+        "direction": {
+          "type": "string",
+          "description": "Sort direction",
+          "enum": ["asc", "desc"],
+          "default": "asc"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Field kind: 'property' for node properties, 'edge' for cross-entity indexes",
+          "enum": ["property", "edge"],
+          "default": "property"
+        }
+      }
+    },
+    "RollupDef": {
+      "type": "object",
+      "description": "A computed rollup field definition",
+      "required": ["name"],
+      "oneOf": [
+        {
+          "properties": {
+            "name": { "type": "string" },
+            "count": {
+              "type": "string",
+              "description": "Edge name to count targets of"
+            }
+          },
+          "required": ["name", "count"]
+        },
+        {
+          "properties": {
+            "name": { "type": "string" },
+            "traverse": {
+              "$ref": "#/definitions/TraverseRollup"
+            }
+          },
+          "required": ["name", "traverse"]
+        },
+        {
+          "properties": {
+            "name": { "type": "string" },
+            "first": {
+              "$ref": "#/definitions/FirstLastRollup"
+            }
+          },
+          "required": ["name", "first"]
+        },
+        {
+          "properties": {
+            "name": { "type": "string" },
+            "last": {
+              "$ref": "#/definitions/FirstLastRollup"
+            }
+          },
+          "required": ["name", "last"]
+        }
+      ]
+    },
+    "TraverseRollup": {
+      "type": "object",
+      "description": "Traverse to edge target and return a property value",
+      "required": ["edge", "property"],
+      "properties": {
+        "edge": {
+          "type": "string",
+          "description": "Edge name to traverse"
+        },
+        "property": {
+          "type": "string",
+          "description": "Property name to return from the target (can also be a rollup name)"
+        }
+      }
+    },
+    "FirstLastRollup": {
+      "type": "object",
+      "description": "Return property from edge target with highest/lowest sort value",
+      "required": ["edge", "field"],
+      "properties": {
+        "edge": {
+          "type": "string",
+          "description": "Edge name to traverse"
+        },
+        "field": {
+          "type": "string",
+          "description": "Property to sort by"
+        },
+        "direction": {
+          "type": "string",
+          "description": "Sort direction",
+          "enum": ["asc", "desc"],
+          "default": "asc"
+        },
+        "property": {
+          "type": "string",
+          "description": "Property to return from the selected target. If omitted, returns the node ID."
+        }
+      }
+    }
+  }
+}
