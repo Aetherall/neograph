@@ -367,20 +367,24 @@ pub const Graph = struct {
     pub fn view(self: *Self, input: query_mod.QueryInput, opts: ViewOpts) !View {
         var qb = query_mod.QueryBuilder.init(self.allocator);
 
-        var q = try qb.build(input);
-
-        // Resolve the root type ID from schema
-        const type_def = self.schema.getType(q.root_type) orelse return error.TypeNotFound;
-        q.root_type_id = type_def.id;
+        const q = try qb.build(input);
 
         const q_ptr = try self.allocator.create(query_mod.Query);
         q_ptr.* = q;
         try self.allocated_queries.append(self.allocator, q_ptr);
 
-        const coverage = self.indexes.selectIndex(q_ptr.root_type_id, q_ptr.filters, q_ptr.sorts) orelse
-            return error.NoIndexCoverage;
+        // Validate query: resolves types, validates edges, selects index
+        const validation = query_mod.validate(q_ptr, &self.schema, &self.indexes) catch |err| {
+            return switch (err) {
+                error.UnknownType => error.TypeNotFound,
+                error.UnknownEdge => error.InvalidQuery,
+                error.UnknownProperty => error.InvalidQuery,
+                error.NoSuitableIndex => error.NoIndexCoverage,
+                error.TypeMismatch => error.InvalidQuery,
+            };
+        };
 
-        return try View.init(self.allocator, &self.tracker, q_ptr, coverage, opts);
+        return try View.init(self.allocator, &self.tracker, validation.query, validation.coverage, opts);
     }
 
     // ========================================================================
@@ -439,7 +443,7 @@ pub const Graph = struct {
     /// Create a view from a JSON query string.
     /// This is the runtime-dynamic version of view() for FFI/Lua bindings.
     pub fn viewFromJson(self: *Self, json_str: []const u8, opts: ViewOpts) !View {
-        var q = json_mod.parseQuery(self.allocator, json_str) catch |err| {
+        const q = json_mod.parseQuery(self.allocator, json_str) catch |err| {
             return switch (err) {
                 error.InvalidJson => error.InvalidJson,
                 error.OutOfMemory => error.OutOfMemory,
@@ -447,13 +451,20 @@ pub const Graph = struct {
             };
         };
 
-        // Resolve the root type ID from schema
-        const type_def = self.schema.getType(q.root_type) orelse return error.TypeNotFound;
-        q.root_type_id = type_def.id;
-
         const q_ptr = try self.allocator.create(query_mod.Query);
         q_ptr.* = q;
         try self.allocated_queries.append(self.allocator, q_ptr);
+
+        // Validate edges (also resolves root type ID)
+        query_mod.validateEdges(q_ptr, &self.schema) catch |err| {
+            return switch (err) {
+                error.UnknownType => error.TypeNotFound,
+                error.UnknownEdge => error.InvalidQuery,
+                error.UnknownProperty => error.InvalidQuery,
+                error.TypeMismatch => error.InvalidQuery,
+                else => error.InvalidQuery,
+            };
+        };
 
         // For direct node ID lookups, use any available index (bypasses filter/sort matching)
         const coverage = if (q_ptr.root_id != null)

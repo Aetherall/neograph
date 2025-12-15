@@ -157,6 +157,26 @@ pub fn build(b: *std.Build) void {
     const cross_entity_index_test_step = b.step("test-cross-entity", "Run cross-entity index acceptance tests");
     cross_entity_index_test_step.dependOn(&run_cross_entity_index_tests.step);
 
+    // View events tests (regression tests for enter/leave events on expanded edges)
+    const view_events_tests = b.addTest(.{
+        .root_module = createTestModule(b, b.path("src/view_events_test.zig"), target, optimize, profile_options),
+    });
+
+    const run_view_events_tests = b.addRunArtifact(view_events_tests);
+
+    const view_events_test_step = b.step("test-view-events", "Run view enter/leave events tests");
+    view_events_test_step.dependOn(&run_view_events_tests.step);
+
+    // Nested expand tests (regression tests for nested edge expansion reactivity)
+    const nested_expand_tests = b.addTest(.{
+        .root_module = createTestModule(b, b.path("src/nested_expand_test.zig"), target, optimize, profile_options),
+    });
+
+    const run_nested_expand_tests = b.addRunArtifact(nested_expand_tests);
+
+    const nested_expand_test_step = b.step("test-nested-expand", "Run nested edge expansion tests");
+    nested_expand_test_step.dependOn(&run_nested_expand_tests.step);
+
     // Profile benchmarks - always compiled with profiling enabled and ReleaseFast
     const profile_options_enabled = b.addOptions();
     profile_options_enabled.addOption(bool, "enabled", true);

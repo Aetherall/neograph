@@ -743,14 +743,19 @@ pub const ChangeTracker = struct {
         // Check if target matches filters for this level
         if (!self.executor.matchesFilters(target_node, edge_sel.filters)) return;
 
-        // Build ancestry for the target (source's ancestry + source)
-        var ancestry = std.ArrayListUnmanaged(NodeId){};
-        defer ancestry.deinit(self.allocator);
+        // Build two ancestry lists:
+        // - visible_ancestry: only visible (non-virtual) ancestors, used for result_set storage
+        // - virtual_ancestry: all ancestors including virtual, used for virtual_descendants tracking
+        var visible_ancestry = std.ArrayListUnmanaged(NodeId){};
+        defer visible_ancestry.deinit(self.allocator);
+        var virtual_ancestry = std.ArrayListUnmanaged(NodeId){};
+        defer virtual_ancestry.deinit(self.allocator);
 
         // Get source's ancestry (NOT including source yet)
         const source_result_opt = sub.result_set.getNode(source_node.id);
         if (source_result_opt) |source_result| {
-            ancestry.appendSlice(self.allocator, source_result.ancestry) catch return;
+            visible_ancestry.appendSlice(self.allocator, source_result.ancestry) catch return;
+            virtual_ancestry.appendSlice(self.allocator, source_result.ancestry) catch return;
         }
 
         // Build composite key for target - match loadChildrenLazy structure:
@@ -765,7 +770,7 @@ pub const ChangeTracker = struct {
         };
 
         // Add ancestor sort values (excluding source)
-        for (ancestry.items) |ancestor_id| {
+        for (visible_ancestry.items) |ancestor_id| {
             const ancestor = self.store.get(ancestor_id) orelse continue;
             appendSortKey(&key, ancestor, query_level.sorts);
             const next = self.nextQueryLevel(query_level, ancestor.type_id);
@@ -781,17 +786,19 @@ pub const ChangeTracker = struct {
         appendSortKey(&key, target_node, edge_sel.sorts);
 
         // Now add source to ancestry for the target's ancestry tracking
-        ancestry.append(self.allocator, source_node.id) catch return;
+        visible_ancestry.append(self.allocator, source_node.id) catch return;
+        virtual_ancestry.append(self.allocator, source_node.id) catch return;
 
         if (edge_sel.virtual) {
             // Target is virtual - add to virtual index and traverse its edges
             self.virtual_to_subs.add(target_node.id, sub) catch return;
-            ancestry.append(self.allocator, target_node.id) catch return;
-            self.addReachableDescendants(sub, target_node, edge_sel.selections, key, &ancestry) catch return;
+            // Only add to virtual_ancestry (visible_ancestry unchanged for virtual nodes)
+            virtual_ancestry.append(self.allocator, target_node.id) catch return;
+            self.addReachableDescendants(sub, target_node, edge_sel.selections, key, &visible_ancestry, &virtual_ancestry, edge_name) catch return;
         } else {
-            // Target is visible - add to result set
-            const owned_ancestry = self.allocator.dupe(NodeId, ancestry.items) catch return;
-            _ = sub.result_set.insertSorted(target_node.id, key, owned_ancestry) catch {
+            // Target is visible - add to result set (with edge_name for expand tracking)
+            const owned_ancestry = self.allocator.dupe(NodeId, visible_ancestry.items) catch return;
+            _ = sub.result_set.insertSortedWithEdge(target_node.id, key, owned_ancestry, edge_name) catch {
                 self.allocator.free(owned_ancestry);
                 return;
             };
@@ -800,7 +807,7 @@ pub const ChangeTracker = struct {
             self.node_to_subs.add(target_node.id, sub) catch return;
 
             // Track virtual ancestors → this visible descendant
-            for (ancestry.items) |ancestor_id| {
+            for (virtual_ancestry.items) |ancestor_id| {
                 if (self.virtual_to_subs.getForKey(ancestor_id).len > 0) {
                     sub.virtual_descendants.add(ancestor_id, target_node.id) catch {};
                 }
@@ -812,19 +819,27 @@ pub const ChangeTracker = struct {
             defer item.deinit();
             sub.emitEnter(item, idx);
 
-            // Continue traversing for target's edges
-            ancestry.append(self.allocator, target_node.id) catch return;
-            self.addReachableDescendants(sub, target_node, edge_sel.selections, key, &ancestry) catch return;
+            // Continue traversing for target's edges (both ancestry lists get the visible node)
+            visible_ancestry.append(self.allocator, target_node.id) catch return;
+            virtual_ancestry.append(self.allocator, target_node.id) catch return;
+            self.addReachableDescendants(sub, target_node, edge_sel.selections, key, &visible_ancestry, &virtual_ancestry, edge_name) catch return;
         }
     }
 
+    /// Add reachable descendants through edge selections.
+    /// Uses two ancestry lists:
+    /// - visible_ancestry: only visible ancestors (for result_set storage)
+    /// - virtual_ancestry: all ancestors including virtual (for virtual_descendants tracking)
+    /// - original_edge_name: the edge name being expanded (for tree view parent-child relationship)
     fn addReachableDescendants(
         self: *Self,
         sub: *Subscription,
         node: *const Node,
         selections: []const EdgeSelection,
         parent_key: CompoundKey,
-        ancestry: *std.ArrayListUnmanaged(NodeId),
+        visible_ancestry: *std.ArrayListUnmanaged(NodeId),
+        virtual_ancestry: *std.ArrayListUnmanaged(NodeId),
+        original_edge_name: []const u8,
     ) !void {
         for (selections) |edge_sel| {
             const edge_def = self.schema.getEdgeDef(node.type_id, edge_sel.name) orelse continue;
@@ -833,7 +848,7 @@ pub const ChangeTracker = struct {
             for (targets) |target_id| {
                 // Skip if already in ancestry (cycle detection)
                 var in_ancestry = false;
-                for (ancestry.items) |ancestor_id| {
+                for (virtual_ancestry.items) |ancestor_id| {
                     if (ancestor_id == target_id) {
                         in_ancestry = true;
                         break;
@@ -851,16 +866,19 @@ pub const ChangeTracker = struct {
                 appendSortKey(&key, target, edge_sel.sorts);
 
                 if (edge_sel.virtual) {
+                    // Virtual node - add to virtual index, only update virtual_ancestry
                     try self.virtual_to_subs.add(target_id, sub);
-                    try ancestry.append(self.allocator, target_id);
-                    try self.addReachableDescendants(sub, target, edge_sel.selections, key, ancestry);
-                    _ = ancestry.pop();
+                    try virtual_ancestry.append(self.allocator, target_id);
+                    try self.addReachableDescendants(sub, target, edge_sel.selections, key, visible_ancestry, virtual_ancestry, original_edge_name);
+                    _ = virtual_ancestry.pop();
                 } else {
-                    const owned_ancestry = try self.allocator.dupe(NodeId, ancestry.items);
-                    _ = try sub.result_set.insertSorted(target_id, key, owned_ancestry);
+                    // Visible node - use visible_ancestry for result_set, virtual_ancestry for tracking
+                    const owned_ancestry = try self.allocator.dupe(NodeId, visible_ancestry.items);
+                    _ = try sub.result_set.insertSortedWithEdge(target_id, key, owned_ancestry, original_edge_name);
                     try self.node_to_subs.add(target_id, sub);
 
-                    for (ancestry.items) |ancestor_id| {
+                    // Track virtual ancestors using virtual_ancestry
+                    for (virtual_ancestry.items) |ancestor_id| {
                         if (self.virtual_to_subs.getForKey(ancestor_id).len > 0) {
                             try sub.virtual_descendants.add(ancestor_id, target_id);
                         }
@@ -871,9 +889,12 @@ pub const ChangeTracker = struct {
                     defer item.deinit();
                     sub.emitEnter(item, idx);
 
-                    try ancestry.append(self.allocator, target_id);
-                    try self.addReachableDescendants(sub, target, edge_sel.selections, key, ancestry);
-                    _ = ancestry.pop();
+                    // Visible node added to both ancestry lists
+                    try visible_ancestry.append(self.allocator, target_id);
+                    try virtual_ancestry.append(self.allocator, target_id);
+                    try self.addReachableDescendants(sub, target, edge_sel.selections, key, visible_ancestry, virtual_ancestry, original_edge_name);
+                    _ = visible_ancestry.pop();
+                    _ = virtual_ancestry.pop();
                 }
             }
         }
@@ -1140,6 +1161,20 @@ pub const ChangeTracker = struct {
             if (is_virtual) {
                 // Virtual child - add to virtual index
                 try self.virtual_to_subs.add(target_id, sub);
+
+                // Also load nested children through the virtual node
+                // This allows items under virtual edges to be visible as children of the parent
+                if (edge_sel) |sel| {
+                    // Track virtual_ancestry separately for virtual_descendants tracking
+                    var virtual_ancestry = std.ArrayListUnmanaged(NodeId){};
+                    defer virtual_ancestry.deinit(self.allocator);
+                    try virtual_ancestry.appendSlice(self.allocator, ancestry.items);
+                    try virtual_ancestry.append(self.allocator, target_id);
+
+                    // visible_ancestry = ancestry (doesn't include virtual target_id)
+                    // Pass the original edge_name so children appear as direct children of parent
+                    try self.loadNestedVisibleChildren(sub, target, sel.selections, key, &ancestry, &virtual_ancestry, edge_name, &loaded_children);
+                }
             } else {
                 // Visible child - add to result set with edge_name for tracking
                 const owned_ancestry = try self.allocator.dupe(NodeId, ancestry.items);
@@ -1152,21 +1187,31 @@ pub const ChangeTracker = struct {
         return try loaded_children.toOwnedSlice(self.allocator);
     }
 
-    /// Recursively collect visible (non-virtual) nodes into the result set.
-    /// Also populates reverse indexes and tracks ancestry.
-    fn collectVisibleNodes(
+    /// Load nested visible children through a virtual node.
+    /// Used when expanding a virtual edge - the visible descendants become children of the parent.
+    /// Parameters:
+    /// - visible_ancestry: Ancestry containing only visible (non-virtual) ancestors
+    /// - virtual_ancestry: Full ancestry including virtual nodes (for virtual_descendants tracking)
+    /// - original_edge_name: The edge name being expanded (the virtual edge)
+    fn loadNestedVisibleChildren(
         self: *Self,
         sub: *Subscription,
         node: *const Node,
         selections: []const EdgeSelection,
         parent_key: CompoundKey,
-        ancestry: *std.ArrayListUnmanaged(NodeId),
+        visible_ancestry: *std.ArrayListUnmanaged(NodeId),
+        virtual_ancestry: *std.ArrayListUnmanaged(NodeId),
+        original_edge_name: []const u8,
+        loaded_children: *std.ArrayListUnmanaged(NodeId),
     ) !void {
         for (selections) |edge_sel| {
             const edge_def = self.schema.getEdgeDef(node.type_id, edge_sel.name) orelse continue;
             const targets = node.getEdgeTargets(edge_def.id);
 
             for (targets) |target_id| {
+                // Skip if already in result set
+                if (sub.result_set.contains(target_id)) continue;
+
                 const target = self.store.get(target_id) orelse continue;
                 if (!self.executor.matchesFilters(target, edge_sel.filters)) continue;
 
@@ -1177,33 +1222,33 @@ pub const ChangeTracker = struct {
                 if (edge_sel.virtual) {
                     // Virtual node - add to virtual index and continue traversing
                     try self.virtual_to_subs.add(target_id, sub);
-                    try ancestry.append(self.allocator, target_id);
-                    try self.collectVisibleNodes(sub, target, edge_sel.selections, key, ancestry);
-                    _ = ancestry.pop();
+                    // Only add to virtual_ancestry (visible_ancestry unchanged for virtual nodes)
+                    try virtual_ancestry.append(self.allocator, target_id);
+                    try self.loadNestedVisibleChildren(sub, target, edge_sel.selections, key, visible_ancestry, virtual_ancestry, original_edge_name, loaded_children);
+                    _ = virtual_ancestry.pop();
                 } else {
-                    // Visible node - add to result set with ancestry
-                    const owned_ancestry = try self.allocator.dupe(NodeId, ancestry.items);
-                    _ = try sub.result_set.insertSorted(target_id, key, owned_ancestry);
+                    // Visible node - add to result set with visible ancestry and original edge name
+                    // This makes the node appear as a direct child of the visible parent
+                    const owned_ancestry = try self.allocator.dupe(NodeId, visible_ancestry.items);
+                    _ = try sub.result_set.insertSortedWithEdge(target_id, key, owned_ancestry, original_edge_name);
 
                     // Add to reverse index
                     try self.node_to_subs.add(target_id, sub);
 
                     // Track virtual ancestors → this visible descendant
-                    for (ancestry.items) |ancestor_id| {
-                        // Check if this ancestor is virtual in this subscription
+                    for (virtual_ancestry.items) |ancestor_id| {
                         if (self.virtual_to_subs.getForKey(ancestor_id).len > 0) {
                             try sub.virtual_descendants.add(ancestor_id, target_id);
                         }
                     }
 
-                    // Continue traversing for deeper nested edges
-                    try ancestry.append(self.allocator, target_id);
-                    try self.collectVisibleNodes(sub, target, edge_sel.selections, key, ancestry);
-                    _ = ancestry.pop();
+                    // Track as loaded child (returned to caller)
+                    try loaded_children.append(self.allocator, target_id);
                 }
             }
         }
     }
+
 
     fn materializeItem(self: *Self, node: *const Node, selections: []const EdgeSelection) !Item {
         _ = selections; // Reactive views load edges lazily via expandById/loadChildrenLazy

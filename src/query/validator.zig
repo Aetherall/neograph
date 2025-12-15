@@ -70,6 +70,19 @@ pub fn validate(
     };
 }
 
+/// Validate only edge selections (without index selection).
+/// Useful for queries that bypass normal index selection (e.g., direct ID lookups).
+pub fn validateEdges(query: *Query, schema: *const Schema) ValidationError!void {
+    // Resolve root type
+    const type_def = schema.getType(query.root_type) orelse return ValidationError.UnknownType;
+    query.root_type_id = type_def.id;
+
+    // Validate edge selections
+    for (query.selections) |edge_sel| {
+        try validateEdgeSelection(edge_sel, type_def, schema);
+    }
+}
+
 fn validateFilter(filter: Filter, type_def: *const TypeDef, schema: *const Schema) ValidationError!void {
     if (filter.path.len == 0) return ValidationError.UnknownProperty;
 

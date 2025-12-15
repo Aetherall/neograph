@@ -234,6 +234,81 @@ pub const EdgeChildren = struct {
 };
 
 // ============================================================================
+// VisibleChainObserver
+// ============================================================================
+
+/// Observer for visible chain mutations.
+///
+/// The ReactiveTree calls these callbacks when the visible chain changes,
+/// allowing external code (like Viewport) to react without the tree knowing
+/// about viewport concepts.
+///
+/// Timing guarantees:
+/// - on_will_remove: Called BEFORE nodes are unlinked (nodes still traversable)
+/// - on_did_remove: Called AFTER nodes are unlinked (chain updated)
+/// - on_did_insert: Called AFTER nodes are linked (nodes traversable)
+/// - on_did_move: Called AFTER node moved to new position
+pub const VisibleChainObserver = struct {
+    /// Called BEFORE nodes are unlinked from visible chain.
+    /// Use: emit on_leave for nodes in viewport range.
+    /// Parameters:
+    ///   - first: First node being removed (still in chain)
+    ///   - start_index: Index of first node
+    ///   - count: Number of nodes being removed
+    on_will_remove: ?*const fn (
+        ctx: ?*anyopaque,
+        first: *TreeNode,
+        start_index: u32,
+        count: u32,
+    ) void = null,
+
+    /// Called AFTER nodes are unlinked from visible chain.
+    /// Use: detect scroll-in, emit on_enter for nodes now in viewport.
+    /// Parameters:
+    ///   - removed_at_index: Index where removal occurred
+    ///   - count: Number of nodes removed
+    ///   - new_total: New total visible count
+    on_did_remove: ?*const fn (
+        ctx: ?*anyopaque,
+        removed_at_index: u32,
+        count: u32,
+        new_total: u32,
+    ) void = null,
+
+    /// Called AFTER nodes are linked into visible chain.
+    /// Use: emit on_enter for inserted nodes in viewport,
+    ///      emit on_leave for nodes pushed out.
+    /// Parameters:
+    ///   - first: First inserted node
+    ///   - start_index: Index of first inserted node
+    ///   - count: Number of nodes inserted
+    ///   - new_total: New total visible count
+    on_did_insert: ?*const fn (
+        ctx: ?*anyopaque,
+        first: *TreeNode,
+        start_index: u32,
+        count: u32,
+        new_total: u32,
+    ) void = null,
+
+    /// Called AFTER a node moved to a new position (sort key change).
+    /// Use: emit on_move if both indices in viewport,
+    ///      or on_enter/on_leave if crossing boundary.
+    /// Parameters:
+    ///   - node: The node that moved
+    ///   - old_index: Previous index
+    ///   - new_index: New index
+    on_did_move: ?*const fn (
+        ctx: ?*anyopaque,
+        node: *TreeNode,
+        old_index: u32,
+        new_index: u32,
+    ) void = null,
+
+    context: ?*anyopaque = null,
+};
+
+// ============================================================================
 // ReactiveTree
 // ============================================================================
 
@@ -262,6 +337,9 @@ pub const ReactiveTree = struct {
 
     // === Node storage (for memory management) ===
     all_nodes: std.AutoHashMapUnmanaged(NodeId, *TreeNode) = .{},
+
+    // === Observer for visible chain changes ===
+    observer: VisibleChainObserver = .{},
 
     const Self = @This();
 
@@ -379,6 +457,11 @@ pub const ReactiveTree = struct {
         self.roots_count += 1;
         self.markIndicesDirtyFrom(index);
 
+        // Notify observer AFTER insertion
+        if (self.observer.on_did_insert) |cb| {
+            cb(self.observer.context, node, index, 1, self.total_visible);
+        }
+
         return node;
     }
 
@@ -390,6 +473,11 @@ pub const ReactiveTree = struct {
 
         const removed_visible = node.visible_count;
         const index = self.indexOf(node);
+
+        // Notify observer BEFORE unlinking (nodes still traversable)
+        if (self.observer.on_will_remove) |cb| {
+            cb(self.observer.context, node, index, removed_visible);
+        }
 
         // Unlink from visible chain (node and all descendants)
         self.unlinkVisibleSubtree(node);
@@ -403,6 +491,11 @@ pub const ReactiveTree = struct {
         self.total_visible -= removed_visible;
         self.roots_count -= 1;
         self.markIndicesDirtyFrom(index);
+
+        // Notify observer AFTER unlinking
+        if (self.observer.on_did_remove) |cb| {
+            cb(self.observer.context, index, removed_visible, self.total_visible);
+        }
     }
 
     /// Move a root node to a new position.
@@ -430,6 +523,11 @@ pub const ReactiveTree = struct {
 
         // Mark indices dirty
         self.markIndicesDirtyFrom(@min(old_index, new_index));
+
+        // Notify observer of move
+        if (self.observer.on_did_move) |cb| {
+            cb(self.observer.context, node, old_index, new_index);
+        }
     }
 
     /// Update a root node's sort key and reposition if needed.
@@ -458,6 +556,11 @@ pub const ReactiveTree = struct {
             const prev_visible = if (after) |a| findLastVisible(a) else null;
             self.relinkVisibleSubtree(node, prev_visible);
             self.markIndicesDirtyFrom(@min(old_index, new_index));
+
+            // Notify observer of move
+            if (self.observer.on_did_move) |cb| {
+                cb(self.observer.context, node, old_index, new_index);
+            }
         }
 
         return .{ .old_index = old_index, .new_index = new_index };
@@ -515,13 +618,23 @@ pub const ReactiveTree = struct {
 
         // If children would be visible, link them into visible chain and update counts
         if (self.areChildrenVisible(parent, edge_name)) {
+            // Get parent index before linking
+            const parent_idx = self.indexOf(parent);
+
             self.linkEdgeChildrenVisible(parent, edge);
 
             // Update visibility counts - propagateVisibilityDelta updates both
             // ancestor visible_counts and total_visible
             const added_visible: u32 = @intCast(children.len);
             self.propagateVisibilityDelta(parent, @intCast(added_visible));
-            self.markIndicesDirtyFrom(self.indexOf(parent) + 1);
+            self.markIndicesDirtyFrom(parent_idx + 1);
+
+            // Notify observer AFTER insertion
+            if (self.observer.on_did_insert) |cb| {
+                if (edge.head) |first_child| {
+                    cb(self.observer.context, first_child, parent_idx + 1, added_visible, self.total_visible);
+                }
+            }
         }
     }
 
@@ -576,7 +689,15 @@ pub const ReactiveTree = struct {
             const prev_visible = self.findPrevVisibleForChild(parent, edge_name, after);
             self.linkVisibleAfter(child, prev_visible);
             self.propagateVisibilityDelta(parent, 1);
-            self.markIndicesDirtyFrom(child.flat_index);
+
+            // Get child's index for observer (indices not dirty yet)
+            const child_index = self.indexOf(child);
+            self.markIndicesDirtyFrom(child_index);
+
+            // Notify observer AFTER insertion
+            if (self.observer.on_did_insert) |cb| {
+                cb(self.observer.context, child, child_index, 1, self.total_visible);
+            }
         }
 
         return child;
@@ -593,6 +714,13 @@ pub const ReactiveTree = struct {
         const is_visible = self.areChildrenVisible(parent, edge_name);
         const removed_visible = child.visible_count;
         const index = if (is_visible) self.indexOf(child) else 0;
+
+        // Notify observer BEFORE unlinking (nodes still traversable)
+        if (is_visible) {
+            if (self.observer.on_will_remove) |cb| {
+                cb(self.observer.context, child, index, removed_visible);
+            }
+        }
 
         // Unlink from visible chain if visible
         if (is_visible) {
@@ -612,6 +740,11 @@ pub const ReactiveTree = struct {
 
         if (is_visible) {
             self.markIndicesDirtyFrom(index);
+
+            // Notify observer AFTER unlinking
+            if (self.observer.on_did_remove) |cb| {
+                cb(self.observer.context, index, removed_visible, self.total_visible);
+            }
         }
     }
 
@@ -649,6 +782,9 @@ pub const ReactiveTree = struct {
         // Children will be linked when an ancestor is expanded.
         if (!self.isVisible(node)) return;
 
+        // Get node index BEFORE linking (for observer)
+        const node_index = self.indexOf(node);
+
         // Link children into visible chain
         self.linkEdgeChildrenVisible(node, @constCast(edge));
 
@@ -661,8 +797,14 @@ pub const ReactiveTree = struct {
         self.total_visible += added_visible;
 
         // Mark indices dirty
-        const node_index = self.indexOf(node);
         self.markIndicesDirtyFrom(node_index + 1);
+
+        // Notify observer AFTER insertion is complete
+        if (self.observer.on_did_insert) |cb| {
+            if (edge.head) |first_child| {
+                cb(self.observer.context, first_child, node_index + 1, added_visible, self.total_visible);
+            }
+        }
 
         // Debug validation
         if (std.debug.runtime_safety) {
@@ -698,6 +840,13 @@ pub const ReactiveTree = struct {
 
         const node_index = self.indexOf(node);
 
+        // Notify observer BEFORE unlinking (nodes still traversable)
+        if (self.observer.on_will_remove) |cb| {
+            if (edge.head) |first_child| {
+                cb(self.observer.context, first_child, node_index + 1, removed_visible);
+            }
+        }
+
         // Unlink children from visible chain
         self.unlinkEdgeChildrenVisible(node, edge);
 
@@ -711,6 +860,11 @@ pub const ReactiveTree = struct {
 
         // Mark indices dirty
         self.markIndicesDirtyFrom(node_index + 1);
+
+        // Notify observer AFTER unlinking is complete
+        if (self.observer.on_did_remove) |cb| {
+            cb(self.observer.context, node_index + 1, removed_visible, self.total_visible);
+        }
 
         // Debug validation
         if (std.debug.runtime_safety) {
@@ -1140,6 +1294,18 @@ pub const ReactiveTree = struct {
         // Compute visible count BEFORE freeing children
         const removed_visible = if (children_visible) self.computeEdgeVisibleCount(edge) else 0;
 
+        // Get parent index for observer (if visible)
+        const parent_idx = if (children_visible) self.indexOf(parent) else 0;
+
+        // Notify observer BEFORE unlinking (nodes still traversable)
+        if (children_visible and removed_visible > 0) {
+            if (self.observer.on_will_remove) |cb| {
+                if (edge.head) |first_child| {
+                    cb(self.observer.context, first_child, parent_idx + 1, removed_visible);
+                }
+            }
+        }
+
         var child = edge.head;
         while (child) |c| {
             const next = c.next_sibling;
@@ -1152,6 +1318,11 @@ pub const ReactiveTree = struct {
 
         if (children_visible) {
             self.propagateVisibilityDelta(parent, -@as(i32, @intCast(removed_visible)));
+
+            // Notify observer AFTER unlinking
+            if (self.observer.on_did_remove) |cb| {
+                cb(self.observer.context, parent_idx + 1, removed_visible, self.total_visible);
+            }
         }
 
         edge.head = null;

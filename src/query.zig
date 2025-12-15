@@ -21,6 +21,7 @@ pub const PathSegment = executor.PathSegment;
 
 pub const validator = @import("query/validator.zig");
 pub const validate = validator.validate;
+pub const validateEdges = validator.validateEdges;
 pub const ValidationError = validator.ValidationError;
 pub const ValidationResult = validator.ValidationResult;
 

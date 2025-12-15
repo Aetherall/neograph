@@ -28,6 +28,7 @@ const CompoundKey = @import("../index/key.zig").CompoundKey;
 const reactive_tree = @import("reactive_tree.zig");
 const ReactiveTree = reactive_tree.ReactiveTree;
 const TreeNode = reactive_tree.TreeNode;
+const VisibleChainObserver = reactive_tree.VisibleChainObserver;
 const Viewport = reactive_tree.Viewport;
 
 /// View options.
@@ -414,6 +415,15 @@ pub const View = struct {
             .context = self,
         };
 
+        // Register as visible chain observer
+        self.reactive_tree.observer = .{
+            .on_will_remove = observerWillRemove,
+            .on_did_remove = observerDidRemove,
+            .on_did_insert = observerDidInsert,
+            .on_did_move = observerDidMove,
+            .context = self,
+        };
+
         // Initialize subscription immediately if requested
         if (immediate) {
             self.tracker.ensureInitialized(self.subscription) catch {};
@@ -628,7 +638,14 @@ pub const View = struct {
     // ========================================================================
 
     /// Expand an edge by node ID directly.
+    /// Does incremental updates when parent is in reactive_tree, emitting enter events
+    /// for children within viewport bounds.
     pub fn expandById(self: *Self, node_id: NodeId, edge_name: []const u8) !void {
+        // Ensure viewport is loaded before expand so that:
+        // 1. Parent node is in node_to_subs for future link events to trigger enter callbacks
+        // 2. Parent node is in reactive_tree so enter events can be emitted for children
+        try self.ensureViewportLoaded();
+
         // Get or create entry for this node
         const gop = try self.expanded_nodes.getOrPut(node_id);
         if (!gop.found_existing) {
@@ -644,22 +661,80 @@ pub const View = struct {
         // Add this edge to the expanded state
         try gop.value_ptr.edges.put(self.allocator, edge_name, children_count);
 
-        // Also mark in TreeNode if loaded (needed for insertChild visibility check)
-        if (self.reactive_tree.get(node_id)) |tree_node| {
-            try tree_node.markExpanded(self.allocator, edge_name);
-        }
+        // Check if parent is in reactive_tree
+        const parent_tree_node = self.reactive_tree.get(node_id);
 
-        // Load children into result_set for reactive tracking (even if not in viewport)
-        // This ensures that unlink callbacks will fire for these children
+        // Load children into result_set for reactive tracking
+        // Note: children may already be in result_set from reactive link events
         const loaded_ids = try self.tracker.loadChildrenLazy(self.subscription, node_id, edge_name);
-        if (loaded_ids.len > 0) self.allocator.free(loaded_ids);
+        defer if (loaded_ids.len > 0) self.allocator.free(loaded_ids);
 
-        // Mark viewport dirty to trigger reload
-        self.viewport_dirty = true;
+        // Incremental update: add children to reactive_tree
+        // Observer callbacks handle enter/leave events automatically
+        if (parent_tree_node) |parent| {
+            // Check if children are already in reactive_tree (from previous expand/collapse cycle)
+            const existing_edge = parent.getEdge(edge_name);
+            if (existing_edge != null and existing_edge.?.head != null) {
+                // Children already in tree, just unlinked - call expand() to re-link them
+                // Note: expand() also marks the edge as expanded
+                // Observer will emit enter/leave events
+                self.reactive_tree.expand(node_id, edge_name);
+            } else {
+                // Children not in tree - mark expanded first (needed for areChildrenVisible in setChildren)
+                try parent.markExpanded(self.allocator, edge_name);
+
+                // Get children from result_set
+                const child_ids = try self.getChildIdsFromResultSetForEdge(node_id, edge_name);
+                defer self.allocator.free(child_ids);
+
+                if (child_ids.len == 0) return; // No children to add
+
+                var children_entries = std.ArrayListUnmanaged(ReactiveTree.ChildEntry){};
+                defer children_entries.deinit(self.allocator);
+
+                for (child_ids) |child_id| {
+                    const result_node = self.subscription.result_set.getNode(child_id) orelse continue;
+                    try children_entries.append(self.allocator, .{
+                        .id = child_id,
+                        .sort_key = result_node.key,
+                    });
+                }
+
+                // Add children to reactive_tree (setChildren links into visible chain if edge expanded)
+                // Observer will emit enter/leave events
+                try self.reactive_tree.setChildren(node_id, edge_name, children_entries.items);
+            }
+        } else {
+            // Parent not in tree - mark viewport dirty for full reload
+            self.viewport_dirty = true;
+        }
+    }
+
+    /// Emit enter event for a child node by ID and index.
+    fn emitEnterForChild(self: *Self, child_id: NodeId, index: u32) void {
+        if (self.external_callbacks.on_enter == null) return;
+
+        const node = self.store.get(child_id) orelse return;
+
+        // Create Item for the callback
+        const path = self.allocator.alloc(PathSegment, 1) catch return;
+        path[0] = .{ .root = child_id };
+
+        var visited = std.AutoHashMapUnmanaged(NodeId, void){};
+        defer visited.deinit(self.allocator);
+
+        var item = self.tracker.executor.materialize(node, &.{}, path, &visited) catch {
+            self.allocator.free(path);
+            return;
+        };
+        defer item.deinit();
+
+        self.external_callbacks.on_enter.?(self.external_callbacks.context, item, index);
     }
 
     /// Collapse an edge by node ID directly.
     /// This also recursively clears expansion state of all descendants.
+    /// Observer callbacks handle enter/leave events automatically.
     pub fn collapseById(self: *Self, node_id: NodeId, edge_name: []const u8) void {
         // First, recursively clear expansion state of children under this edge
         self.clearDescendantExpansions(node_id, edge_name);
@@ -675,13 +750,39 @@ pub const View = struct {
             }
         }
 
-        // Also collapse in reactive_tree if loaded
-        if (self.reactive_tree.get(node_id)) |tree_node| {
-            tree_node.markCollapsed(self.allocator, edge_name);
+        // Collapse in reactive_tree - observer handles enter/leave events
+        if (self.reactive_tree.get(node_id)) |parent| {
+            if (parent.isExpanded(edge_name)) {
+                // Collapse in reactive_tree (unlinks children from visible chain, keeps them in tree)
+                // Observer will emit leave events before unlink, and enter events after for scroll-in
+                self.reactive_tree.collapse(node_id, edge_name);
+            }
+        } else {
+            // Parent not in tree - mark viewport dirty for full reload
+            self.viewport_dirty = true;
         }
+    }
 
-        // Mark viewport dirty to trigger reload
-        self.viewport_dirty = true;
+    /// Emit leave event for a child node by ID and index.
+    fn emitLeaveForChild(self: *Self, child_id: NodeId, index: u32) void {
+        if (self.external_callbacks.on_leave == null) return;
+
+        const node = self.store.get(child_id) orelse return;
+
+        // Create Item for the callback
+        const path = self.allocator.alloc(PathSegment, 1) catch return;
+        path[0] = .{ .root = child_id };
+
+        var visited = std.AutoHashMapUnmanaged(NodeId, void){};
+        defer visited.deinit(self.allocator);
+
+        var item = self.tracker.executor.materialize(node, &.{}, path, &visited) catch {
+            self.allocator.free(path);
+            return;
+        };
+        defer item.deinit();
+
+        self.external_callbacks.on_leave.?(self.external_callbacks.context, item, index);
     }
 
     /// Recursively clear expansion state of all descendants under a given edge.
@@ -972,8 +1073,11 @@ pub const View = struct {
         const result_node = self.subscription.result_set.getNode(item.id) orelse return;
         const sort_key = result_node.key;
 
+        // Note: external on_enter callbacks are handled by the observer when the tree changes
+
         if (result_node.ancestry.len == 0) {
             // Root node - insert as root
+            // Observer will emit on_enter callback
             _ = self.reactive_tree.insertRootAt(item.id, sort_key, index) catch return;
             // Only adjust viewport if it's been loaded (not dirty)
             // If dirty, reloadViewport will resync from scratch
@@ -1027,6 +1131,7 @@ pub const View = struct {
                 }
 
                 // Add to reactive_tree
+                // Observer will emit on_enter callback if node becomes visible
                 if (self.reactive_tree.get(parent_id)) |parent_tree_node| {
                     // Parent is in tree - add as child if expanded
                     // Use is_edge_expanded (from expanded_nodes) NOT tree_node.isExpanded()
@@ -1051,11 +1156,6 @@ pub const View = struct {
                 }
             }
             // If parent's edge isn't expanded, child stays in result_set for later
-        }
-
-        // Call external callback if set
-        if (self.external_callbacks.on_enter) |cb| {
-            cb(self.external_callbacks.context, item, index);
         }
     }
 
@@ -1120,12 +1220,12 @@ pub const View = struct {
                     }
                 }
             }
+            // Node not in tree, so observer won't fire - emit directly
+            if (self.external_callbacks.on_leave) |cb| {
+                cb(self.external_callbacks.context, item, index);
+            }
         }
-
-        // Call external callback if set
-        if (self.external_callbacks.on_leave) |cb| {
-            cb(self.external_callbacks.context, item, index);
-        }
+        // When node IS in tree, observer handles on_leave - see observerWillRemove
     }
 
     fn handleChange(ctx: ?*anyopaque, item: Item, index: u32, old: Item) void {
@@ -1147,20 +1247,186 @@ pub const View = struct {
         }
     }
 
-    fn handleMove(ctx: ?*anyopaque, item: Item, from: u32, to: u32) void {
+    fn handleMove(ctx: ?*anyopaque, item: Item, _: u32, to: u32) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
 
         // Update reactive_tree if node is loaded (optional - tree may not be loaded yet)
+        // The observer will handle emitting on_move callback
         if (self.reactive_tree.get(item.id) != null) {
             self.reactive_tree.moveRoot(item.id, to);
             // Sync viewport.first with reactive_tree.visible_head after move
             self.viewport.first = self.reactive_tree.visible_head;
         }
+        // Observer handles on_move callback - see observerDidMove
+    }
 
-        // Call external callback if set (always, regardless of tree load state)
-        if (self.external_callbacks.on_move) |cb| {
-            cb(self.external_callbacks.context, item, from, to);
+    // ========================================================================
+    // Visible chain observer callbacks
+    // ========================================================================
+
+    /// Called BEFORE nodes are removed from visible chain.
+    /// Emits on_leave for nodes that were in the viewport.
+    fn observerWillRemove(ctx: ?*anyopaque, first: *TreeNode, start_index: u32, count: u32) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.external_callbacks.on_leave == null) return;
+
+        const vp_start = self.viewport.offset;
+        const vp_end = self.viewport.offset +| self.viewport.height;
+
+        // Walk the chain and emit leave for nodes in viewport
+        var node: ?*TreeNode = first;
+        var idx = start_index;
+        var remaining = count;
+
+        while (node) |n| {
+            if (remaining == 0) break;
+            if (idx >= vp_end) break; // Past viewport, no more to emit
+
+            if (idx >= vp_start) {
+                self.emitLeaveForChild(n.id, idx);
+            }
+
+            idx += 1;
+            remaining -= 1;
+            node = n.next_visible;
         }
+    }
+
+    /// Called AFTER nodes are removed from visible chain.
+    /// Emits on_enter for nodes that scrolled into the viewport.
+    fn observerDidRemove(ctx: ?*anyopaque, _: u32, count: u32, new_total: u32) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        if (self.external_callbacks.on_enter == null) return;
+
+        const vp_end = self.viewport.offset +| self.viewport.height;
+
+        // After removal, items that were at [vp_end, vp_end + count) are now at [vp_end - count, vp_end)
+        // These scrolled into the viewport and need enter events
+        if (new_total <= self.viewport.offset) return; // Nothing in viewport
+
+        // Calculate where scroll-in items are now
+        const scroll_in_start = if (vp_end > count) vp_end - count else 0;
+        const scroll_in_start_capped = @max(scroll_in_start, self.viewport.offset);
+        const scroll_in_end = @min(vp_end, new_total);
+
+        if (scroll_in_start_capped >= scroll_in_end) return;
+
+        // Walk to the scroll-in start position
+        var node = self.reactive_tree.visible_head;
+        var idx: u32 = 0;
+
+        while (node) |n| {
+            if (idx >= scroll_in_start_capped) break;
+            idx += 1;
+            node = n.next_visible;
+        }
+
+        // Emit enter for scroll-in items
+        while (node) |n| {
+            if (idx >= scroll_in_end) break;
+            self.emitEnterForChild(n.id, idx);
+            idx += 1;
+            node = n.next_visible;
+        }
+    }
+
+    /// Called AFTER nodes are inserted into visible chain.
+    /// Emits on_enter for inserted nodes in viewport, on_leave for pushed-out nodes.
+    fn observerDidInsert(ctx: ?*anyopaque, first: *TreeNode, start_index: u32, count: u32, new_total: u32) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        const vp_start = self.viewport.offset;
+        const vp_end = self.viewport.offset +| self.viewport.height;
+
+        // Emit on_enter for inserted nodes that are in viewport
+        if (self.external_callbacks.on_enter != null) {
+            var node: ?*TreeNode = first;
+            var idx = start_index;
+            var remaining = count;
+
+            while (node) |n| {
+                if (remaining == 0) break;
+                if (idx >= vp_end) break; // Past viewport
+
+                if (idx >= vp_start) {
+                    self.emitEnterForChild(n.id, idx);
+                }
+
+                idx += 1;
+                remaining -= 1;
+                node = n.next_visible;
+            }
+        }
+
+        // Emit on_leave for nodes pushed out of viewport
+        // Nodes that were at [vp_end - count, vp_end) are now at [vp_end, vp_end + count)
+        if (self.external_callbacks.on_leave != null and start_index < vp_end) {
+            const old_vp_end = vp_end -| count;
+            const pushed_start = @max(old_vp_end, vp_start);
+
+            if (pushed_start < vp_end and new_total > vp_end) {
+                // Walk to find the pushed-out nodes (now at vp_end onwards)
+                var node = self.reactive_tree.visible_head;
+                var idx: u32 = 0;
+
+                // Skip to vp_end
+                while (node) |n| {
+                    if (idx >= vp_end) break;
+                    idx += 1;
+                    node = n.next_visible;
+                }
+
+                // Emit leave for pushed-out nodes
+                var emitted: u32 = 0;
+                const to_emit = @min(count, new_total - vp_end);
+                while (node) |n| {
+                    if (emitted >= to_emit) break;
+                    // Use original index (before insertion) for the callback
+                    self.emitLeaveForChild(n.id, pushed_start + emitted);
+                    emitted += 1;
+                    node = n.next_visible;
+                }
+            }
+        }
+    }
+
+    /// Called AFTER a node moved to a new position.
+    /// Emits on_move if both indices in viewport, or on_enter/on_leave if crossing boundary.
+    fn observerDidMove(ctx: ?*anyopaque, node: *TreeNode, old_index: u32, new_index: u32) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        const vp_start = self.viewport.offset;
+        const vp_end = self.viewport.offset +| self.viewport.height;
+
+        const was_in_vp = old_index >= vp_start and old_index < vp_end;
+        const is_in_vp = new_index >= vp_start and new_index < vp_end;
+
+        if (was_in_vp and is_in_vp) {
+            // Both in viewport - emit move
+            if (self.external_callbacks.on_move) |cb| {
+                const store_node = self.store.get(node.id) orelse return;
+                const path = self.allocator.alloc(PathSegment, 1) catch return;
+                path[0] = .{ .root = node.id };
+
+                var visited = std.AutoHashMapUnmanaged(NodeId, void){};
+                defer visited.deinit(self.allocator);
+
+                var item = self.tracker.executor.materialize(store_node, &.{}, path, &visited) catch {
+                    self.allocator.free(path);
+                    return;
+                };
+                defer item.deinit();
+
+                cb(self.external_callbacks.context, item, old_index, new_index);
+            }
+        } else if (was_in_vp and !is_in_vp) {
+            // Left viewport
+            self.emitLeaveForChild(node.id, old_index);
+        } else if (!was_in_vp and is_in_vp) {
+            // Entered viewport
+            self.emitEnterForChild(node.id, new_index);
+        }
+        // If both outside viewport, nothing to emit
     }
 };
 

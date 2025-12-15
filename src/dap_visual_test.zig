@@ -795,8 +795,8 @@ test "DAP: viewport spans multiple edge types" {
     // Should see both breakpoints and sources in same viewport
     // Order depends on sort keys - just verify both types appear
     try renderer.buffer.expectContainsLines(
-        \\Source[
         \\Breakpoint[
+        \\Source[
     );
 }
 

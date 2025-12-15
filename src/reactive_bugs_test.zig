@@ -1,9 +1,8 @@
-///! Tests for the reactive system that verify bugs are FIXED.
+///! Regression tests for the reactive system.
 ///!
-///! These tests document issues that were identified in the reactive system audit
-///! and verify they are now fixed through the public Graph API.
-///!
-///! See docs/reactive-system-audit.md for full details on each issue.
+///! These tests verify correct behavior of expand/collapse operations,
+///! viewport events, and edge cases in the reactive update system.
+///! All tests use the public Graph API only.
 
 const std = @import("std");
 const testing = std.testing;
@@ -1924,4 +1923,643 @@ test "BUG: View rooted at Child should not show sibling children of same parent"
     // These assertions will FAIL if the bug exists
     try testing.expect(!child2_found);
     try testing.expectEqual(@as(u32, 2), count_after);
+}
+
+// ============================================================================
+// Viewport overflow events
+// ============================================================================
+
+test "expand() should emit leave events for items pushed out of viewport" {
+    // SCENARIO:
+    // - Viewport has height=3 (can show 3 items)
+    // - We have: Root1, Root2, Root3 visible in viewport
+    // - Root1 has 2 children (collapsed)
+    // - When we expand Root1, children enter viewport
+    // - Root2 and Root3 get pushed OUT of viewport
+    //
+    // EXPECTED:
+    // - Enter events for Child1, Child2 (entering viewport)
+    // - Leave events for Root2, Root3 (pushed out of viewport)
+    //
+    // CURRENT BEHAVIOR:
+    // - Enter events fire for children
+    // - NO leave events for items pushed out
+
+    ensureWatchdog();
+
+    const schema = try createParentChildSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    // Create 3 parents (roots)
+    const root1 = try g.insert("Parent");
+    try g.update(root1, .{ .name = "Root1" });
+
+    const root2 = try g.insert("Parent");
+    try g.update(root2, .{ .name = "Root2" });
+
+    const root3 = try g.insert("Parent");
+    try g.update(root3, .{ .name = "Root3" });
+
+    // Create 2 children for root1
+    const child1 = try g.insert("Child");
+    try g.update(child1, .{ .name = "Child1" });
+    try g.link(root1, "children", child1);
+
+    const child2 = try g.insert("Child");
+    try g.update(child2, .{ .name = "Child2" });
+    try g.link(root1, "children", child2);
+
+    // Create view with small viewport (height=3)
+    var view = try g.view(.{
+        .root = "Parent",
+        .sort = &.{"name"},
+        .edges = &.{.{
+            .name = "children",
+            .sort = &.{"name"},
+        }},
+    }, .{ .limit = 3 }); // Only 3 items visible!
+    defer view.deinit();
+
+    // Track events using CallbackTracker
+    var tracker = CallbackTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    view.setCallbacks(tracker.getCallbacks());
+    view.activate(true);
+
+    // Initial state: Root1, Root2, Root3 in viewport
+    var iter = view.items();
+    var count: u32 = 0;
+    while (iter.next()) |_| count += 1;
+    try testing.expectEqual(@as(u32, 3), count);
+
+    // Clear event tracking
+    tracker.enters.clearRetainingCapacity();
+    tracker.leaves.clearRetainingCapacity();
+
+    // Expand Root1 -> adds Child1, Child2
+    // Viewport should now show: Root1, Child1, Child2
+    // Root2, Root3 should be pushed OUT
+    try view.expandById(root1, "children");
+
+    std.debug.print("\n=== expand() viewport overflow ===\n", .{});
+    std.debug.print("Enter events: ", .{});
+    for (tracker.enters.items) |e| std.debug.print("{} ", .{e.node_id});
+    std.debug.print("\nLeave events: ", .{});
+    for (tracker.leaves.items) |e| std.debug.print("{} ", .{e.node_id});
+    std.debug.print("\n", .{});
+
+    // Verify children entered
+    const child1_entered = tracker.hasEntered(child1);
+    const child2_entered = tracker.hasEntered(child2);
+    try testing.expect(child1_entered);
+    try testing.expect(child2_entered);
+
+    // Root2 and Root3 should have leave events (pushed out of viewport)
+    var root2_left = false;
+    var root3_left = false;
+    for (tracker.leaves.items) |record| {
+        if (record.node_id == root2) root2_left = true;
+        if (record.node_id == root3) root3_left = true;
+    }
+
+    std.debug.print("Root2 left: {}, Root3 left: {}\n", .{ root2_left, root3_left });
+    std.debug.print("EXPECTED: true, true (items pushed out should fire leave)\n", .{});
+
+    // These will FAIL until we fix the gap
+    try testing.expect(root2_left);
+    try testing.expect(root3_left);
+}
+
+test "collapse() should emit enter events for items scrolling into viewport" {
+    // SCENARIO:
+    // - Viewport has height=3
+    // - Root1 is expanded with Child1, Child2
+    // - Viewport shows: Root1, Child1, Child2
+    // - Root2 exists but is OUTSIDE viewport
+    // - When we collapse Root1, children leave
+    // - Root2 should scroll INTO viewport
+    //
+    // EXPECTED:
+    // - Leave events for Child1, Child2 (collapsing)
+    // - Enter event for Root2 (scrolling into viewport)
+    //
+    // CURRENT BEHAVIOR:
+    // - Leave events fire for children
+    // - NO enter event for Root2 scrolling in
+
+    ensureWatchdog();
+
+    const schema = try createParentChildSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    // Create 2 parents (roots)
+    const root1 = try g.insert("Parent");
+    try g.update(root1, .{ .name = "Root1" });
+
+    const root2 = try g.insert("Parent");
+    try g.update(root2, .{ .name = "Root2" });
+
+    // Create 2 children for root1
+    const child1 = try g.insert("Child");
+    try g.update(child1, .{ .name = "Child1" });
+    try g.link(root1, "children", child1);
+
+    const child2 = try g.insert("Child");
+    try g.update(child2, .{ .name = "Child2" });
+    try g.link(root1, "children", child2);
+
+    // Create view with small viewport (height=3)
+    var view = try g.view(.{
+        .root = "Parent",
+        .sort = &.{"name"},
+        .edges = &.{.{
+            .name = "children",
+            .sort = &.{"name"},
+        }},
+    }, .{ .limit = 3 }); // Only 3 items visible!
+    defer view.deinit();
+
+    view.activate(true);
+
+    // Expand Root1 first
+    try view.expandById(root1, "children");
+
+    // Verify initial state: Root1, Child1, Child2 in viewport (Root2 outside)
+    var iter = view.items();
+    var count: u32 = 0;
+    var root2_visible_before = false;
+    while (iter.next()) |item| {
+        count += 1;
+        if (item.id == root2) root2_visible_before = true;
+    }
+    try testing.expectEqual(@as(u32, 3), count);
+    try testing.expect(!root2_visible_before); // Root2 should be outside viewport
+
+    // Track events using CallbackTracker
+    var tracker = CallbackTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    view.setCallbacks(tracker.getCallbacks());
+
+    // Collapse Root1 -> removes Child1, Child2 from viewport
+    // Root2 should scroll INTO viewport
+    view.collapseById(root1, "children");
+
+    std.debug.print("\n=== collapse() viewport scroll-in ===\n", .{});
+    std.debug.print("Enter events: ", .{});
+    for (tracker.enters.items) |e| std.debug.print("{} ", .{e.node_id});
+    std.debug.print("\nLeave events: ", .{});
+    for (tracker.leaves.items) |e| std.debug.print("{} ", .{e.node_id});
+    std.debug.print("\n", .{});
+
+    // Verify children left
+    var child1_left = false;
+    var child2_left = false;
+    for (tracker.leaves.items) |record| {
+        if (record.node_id == child1) child1_left = true;
+        if (record.node_id == child2) child2_left = true;
+    }
+    try testing.expect(child1_left);
+    try testing.expect(child2_left);
+
+    // Root2 should have enter event (scrolled into viewport)
+    const root2_entered = tracker.hasEntered(root2);
+
+    std.debug.print("Root2 entered: {}\n", .{root2_entered});
+    std.debug.print("EXPECTED: true (item scrolling in should fire enter)\n", .{});
+
+    // This will FAIL until we fix the gap
+    try testing.expect(root2_entered);
+}
+
+// ============================================================================
+// Expand/Collapse Event Trust Tests
+// ============================================================================
+
+test "expand/collapse: enter events fire in DFS order" {
+    // SCENARIO:
+    // - Parent with 3 children: Child1, Child2, Child3 (sorted by name)
+    // - When expanding parent, enter events should fire in DFS order
+    // - DFS order = Child1, Child2, Child3 (sorted traversal)
+
+    ensureWatchdog();
+
+    const schema = try createParentChildSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    const parent = try g.insert("Parent");
+    try g.update(parent, .{ .name = "Parent1" });
+
+    // Create children in reverse order to ensure sorting matters
+    const child3 = try g.insert("Child");
+    try g.update(child3, .{ .name = "Child3" });
+    try g.link(parent, "children", child3);
+
+    const child1 = try g.insert("Child");
+    try g.update(child1, .{ .name = "Child1" });
+    try g.link(parent, "children", child1);
+
+    const child2 = try g.insert("Child");
+    try g.update(child2, .{ .name = "Child2" });
+    try g.link(parent, "children", child2);
+
+    var view = try g.view(.{
+        .root = "Parent",
+        .sort = &.{"name"},
+        .edges = &.{.{
+            .name = "children",
+            .sort = &.{"name"},
+        }},
+    }, .{ .limit = 100 });
+    defer view.deinit();
+
+    var tracker = CallbackTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    view.setCallbacks(tracker.getCallbacks());
+    view.activate(true);
+
+    // Load viewport first (required before expand)
+    var iter = view.items();
+    while (iter.next()) |_| {}
+
+    // Clear initial events
+    tracker.enters.clearRetainingCapacity();
+
+    // Expand parent
+    try view.expandById(parent, "children");
+
+    // Verify events fired in DFS (sorted) order: Child1, Child2, Child3
+    try testing.expectEqual(@as(usize, 3), tracker.enters.items.len);
+    try testing.expectEqual(child1, tracker.enters.items[0].node_id);
+    try testing.expectEqual(child2, tracker.enters.items[1].node_id);
+    try testing.expectEqual(child3, tracker.enters.items[2].node_id);
+}
+
+test "expand/collapse: re-expand produces identical enter events" {
+    // SCENARIO:
+    // - Expand parent to see children
+    // - Collapse parent
+    // - Re-expand parent
+    // - Enter events from re-expand should match original expand
+
+    ensureWatchdog();
+
+    const schema = try createParentChildSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    const parent = try g.insert("Parent");
+    try g.update(parent, .{ .name = "Parent1" });
+
+    const child1 = try g.insert("Child");
+    try g.update(child1, .{ .name = "Child1" });
+    try g.link(parent, "children", child1);
+
+    const child2 = try g.insert("Child");
+    try g.update(child2, .{ .name = "Child2" });
+    try g.link(parent, "children", child2);
+
+    var view = try g.view(.{
+        .root = "Parent",
+        .sort = &.{"name"},
+        .edges = &.{.{
+            .name = "children",
+            .sort = &.{"name"},
+        }},
+    }, .{ .limit = 100 });
+    defer view.deinit();
+
+    var tracker = CallbackTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    view.setCallbacks(tracker.getCallbacks());
+    view.activate(true);
+
+    // Load viewport first (required before expand)
+    var iter = view.items();
+    while (iter.next()) |_| {}
+
+    // First expand
+    tracker.enters.clearRetainingCapacity();
+    try view.expandById(parent, "children");
+
+    const first_expand_count = tracker.enters.items.len;
+    var first_expand_ids: [10]u64 = undefined;
+    for (tracker.enters.items, 0..) |record, i| {
+        if (i < 10) first_expand_ids[i] = record.node_id;
+    }
+
+    // Collapse
+    view.collapseById(parent, "children");
+
+    // Load viewport again after collapse
+    iter = view.items();
+    while (iter.next()) |_| {}
+
+    // Re-expand
+    tracker.enters.clearRetainingCapacity();
+    try view.expandById(parent, "children");
+
+    // Verify identical events
+    try testing.expectEqual(first_expand_count, tracker.enters.items.len);
+    for (tracker.enters.items, 0..) |record, i| {
+        if (i < first_expand_count) {
+            try testing.expectEqual(first_expand_ids[i], record.node_id);
+        }
+    }
+}
+
+test "expand/collapse: nested expansion fires events at each level" {
+    // SCENARIO:
+    // - Grandparent -> Parent -> Child hierarchy
+    // - Expand grandparent: enter event for parent
+    // - Expand parent: enter event for child
+    // - Collapse grandparent: leave events for both parent AND child
+
+    ensureWatchdog();
+
+    const schema = try createHierarchySchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    const session = try g.insert("Session");
+    try g.update(session, .{ .name = "Session1", .priority = @as(i64, 1) });
+
+    const thread = try g.insert("Thread");
+    try g.update(thread, .{ .tid = @as(i64, 1) });
+    try g.link(session, "threads", thread);
+
+    const frame = try g.insert("Frame");
+    try g.update(frame, .{ .name = "main", .index = @as(i64, 0) });
+    try g.link(thread, "frames", frame);
+
+    var view = try g.view(.{
+        .root = "Session",
+        .sort = &.{"priority"},
+        .edges = &.{.{
+            .name = "threads",
+            .sort = &.{"tid"},
+            .edges = &.{.{
+                .name = "frames",
+                .sort = &.{"index"},
+            }},
+        }},
+    }, .{ .limit = 100 });
+    defer view.deinit();
+
+    var tracker = CallbackTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    view.setCallbacks(tracker.getCallbacks());
+    view.activate(true);
+
+    // Load viewport first
+    var iter = view.items();
+    while (iter.next()) |_| {}
+
+    // Expand session -> threads
+    tracker.enters.clearRetainingCapacity();
+    try view.expandById(session, "threads");
+    try testing.expectEqual(@as(usize, 1), tracker.enters.items.len);
+    try testing.expectEqual(thread, tracker.enters.items[0].node_id);
+
+    // Load viewport after first expand
+    iter = view.items();
+    while (iter.next()) |_| {}
+
+    // Expand thread -> frames
+    tracker.enters.clearRetainingCapacity();
+    try view.expandById(thread, "frames");
+    try testing.expectEqual(@as(usize, 1), tracker.enters.items.len);
+    try testing.expectEqual(frame, tracker.enters.items[0].node_id);
+
+    // Collapse session -> should emit leave for BOTH thread and frame
+    tracker.leaves.clearRetainingCapacity();
+    view.collapseById(session, "threads");
+
+    // Both thread and frame should have leave events
+    var thread_left = false;
+    var frame_left = false;
+    for (tracker.leaves.items) |record| {
+        if (record.node_id == thread) thread_left = true;
+        if (record.node_id == frame) frame_left = true;
+    }
+    try testing.expect(thread_left);
+    try testing.expect(frame_left);
+}
+
+test "expand/collapse: enter events only for items entering viewport" {
+    // SCENARIO:
+    // - Viewport height = 2
+    // - Parent with 4 children
+    // - Only first 2 children should get enter events (viewport limit)
+
+    ensureWatchdog();
+
+    const schema = try createParentChildSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    const parent = try g.insert("Parent");
+    try g.update(parent, .{ .name = "Parent1" });
+
+    const child1 = try g.insert("Child");
+    try g.update(child1, .{ .name = "Child1" });
+    try g.link(parent, "children", child1);
+
+    const child2 = try g.insert("Child");
+    try g.update(child2, .{ .name = "Child2" });
+    try g.link(parent, "children", child2);
+
+    const child3 = try g.insert("Child");
+    try g.update(child3, .{ .name = "Child3" });
+    try g.link(parent, "children", child3);
+
+    const child4 = try g.insert("Child");
+    try g.update(child4, .{ .name = "Child4" });
+    try g.link(parent, "children", child4);
+
+    // Small viewport: only 2 items visible
+    var view = try g.view(.{
+        .root = "Parent",
+        .sort = &.{"name"},
+        .edges = &.{.{
+            .name = "children",
+            .sort = &.{"name"},
+        }},
+    }, .{ .limit = 2 });
+    defer view.deinit();
+
+    var tracker = CallbackTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    view.setCallbacks(tracker.getCallbacks());
+    view.activate(true);
+
+    // Load viewport first
+    var iter = view.items();
+    while (iter.next()) |_| {}
+
+    // Clear initial events (parent entered)
+    tracker.enters.clearRetainingCapacity();
+
+    // Expand parent - viewport is [Parent, Child1] so only Child1 enters
+    try view.expandById(parent, "children");
+
+    // Only Child1 should have enter event (viewport limit = 2, Parent + Child1)
+    try testing.expectEqual(@as(usize, 1), tracker.enters.items.len);
+    try testing.expectEqual(child1, tracker.enters.items[0].node_id);
+
+    // Child2, Child3, Child4 should NOT have enter events (outside viewport)
+    try testing.expect(!tracker.hasEntered(child2));
+    try testing.expect(!tracker.hasEntered(child3));
+    try testing.expect(!tracker.hasEntered(child4));
+}
+
+test "expand/collapse: event count matches visible item delta" {
+    // SCENARIO:
+    // - Track items before and after expand
+    // - Number of enter events should equal items_after - items_before
+
+    ensureWatchdog();
+
+    const schema = try createParentChildSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    const parent = try g.insert("Parent");
+    try g.update(parent, .{ .name = "Parent1" });
+
+    const child1 = try g.insert("Child");
+    try g.update(child1, .{ .name = "Child1" });
+    try g.link(parent, "children", child1);
+
+    const child2 = try g.insert("Child");
+    try g.update(child2, .{ .name = "Child2" });
+    try g.link(parent, "children", child2);
+
+    const child3 = try g.insert("Child");
+    try g.update(child3, .{ .name = "Child3" });
+    try g.link(parent, "children", child3);
+
+    var view = try g.view(.{
+        .root = "Parent",
+        .sort = &.{"name"},
+        .edges = &.{.{
+            .name = "children",
+            .sort = &.{"name"},
+        }},
+    }, .{ .limit = 100 });
+    defer view.deinit();
+
+    var tracker = CallbackTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    view.setCallbacks(tracker.getCallbacks());
+    view.activate(true);
+
+    // Load viewport and count items before expand
+    var iter = view.items();
+    var items_before: u32 = 0;
+    while (iter.next()) |_| items_before += 1;
+
+    // Expand
+    tracker.enters.clearRetainingCapacity();
+    try view.expandById(parent, "children");
+
+    // Count items after expand
+    iter = view.items();
+    var items_after: u32 = 0;
+    while (iter.next()) |_| items_after += 1;
+
+    // Enter event count should equal delta
+    const delta = items_after - items_before;
+    try testing.expectEqual(delta, @as(u32, @intCast(tracker.enters.items.len)));
+
+    // Now test collapse
+    tracker.leaves.clearRetainingCapacity();
+    view.collapseById(parent, "children");
+
+    // Load viewport and count items after collapse
+    iter = view.items();
+    var items_after_collapse: u32 = 0;
+    while (iter.next()) |_| items_after_collapse += 1;
+
+    // Leave event count should equal delta
+    const collapse_delta = items_after - items_after_collapse;
+    try testing.expectEqual(collapse_delta, @as(u32, @intCast(tracker.leaves.items.len)));
+}
+
+test "expand/collapse: no duplicate events on repeated operations" {
+    // SCENARIO:
+    // - Expand already-expanded node should not fire duplicate enter events
+    // - Collapse already-collapsed node should not fire duplicate leave events
+
+    ensureWatchdog();
+
+    const schema = try createParentChildSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    const parent = try g.insert("Parent");
+    try g.update(parent, .{ .name = "Parent1" });
+
+    const child1 = try g.insert("Child");
+    try g.update(child1, .{ .name = "Child1" });
+    try g.link(parent, "children", child1);
+
+    var view = try g.view(.{
+        .root = "Parent",
+        .sort = &.{"name"},
+        .edges = &.{.{
+            .name = "children",
+            .sort = &.{"name"},
+        }},
+    }, .{ .limit = 100 });
+    defer view.deinit();
+
+    var tracker = CallbackTracker.init(testing.allocator);
+    defer tracker.deinit();
+
+    view.setCallbacks(tracker.getCallbacks());
+    view.activate(true);
+
+    // Load viewport first
+    var iter = view.items();
+    while (iter.next()) |_| {}
+
+    // First expand
+    tracker.enters.clearRetainingCapacity();
+    try view.expandById(parent, "children");
+    const first_expand_events = tracker.enters.items.len;
+    try testing.expectEqual(@as(usize, 1), first_expand_events);
+
+    // Load viewport after expand
+    iter = view.items();
+    while (iter.next()) |_| {}
+
+    // Second expand (already expanded) - should not fire duplicate events
+    tracker.enters.clearRetainingCapacity();
+    try view.expandById(parent, "children");
+    try testing.expectEqual(@as(usize, 0), tracker.enters.items.len);
+
+    // First collapse
+    tracker.leaves.clearRetainingCapacity();
+    view.collapseById(parent, "children");
+    const first_collapse_events = tracker.leaves.items.len;
+    try testing.expectEqual(@as(usize, 1), first_collapse_events);
+
+    // Load viewport after collapse
+    iter = view.items();
+    while (iter.next()) |_| {}
+
+    // Second collapse (already collapsed) - should not fire duplicate events
+    tracker.leaves.clearRetainingCapacity();
+    view.collapseById(parent, "children");
+    try testing.expectEqual(@as(usize, 0), tracker.leaves.items.len);
 }
