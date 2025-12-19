@@ -94,6 +94,10 @@ pub const View = struct {
     loaded_viewport_offset: u32 = 0,
     viewport_dirty: bool = true,
 
+    // Re-entrancy guard: prevent items() from triggering reloadViewport()
+    // while we're already inside reloadViewport() or processing callbacks
+    in_callback: bool = false,
+
     // External callbacks for reactive updates
     external_callbacks: Callbacks = .{},
 
@@ -138,6 +142,11 @@ pub const View = struct {
     /// Uses position computation to handle expansions correctly.
     /// Handles recursive expansions (children that are also expanded).
     fn reloadViewport(self: *Self) !void {
+        // Set re-entrancy guard to prevent items() calls during callbacks from
+        // triggering another reloadViewport(), which would corrupt the tree
+        self.in_callback = true;
+        defer self.in_callback = false;
+
         // Untrack old nodes from this subscription
         self.untrackLoadedNodes();
 
@@ -393,6 +402,10 @@ pub const View = struct {
     /// Ensure viewport is loaded. Called lazily on first access.
     fn ensureViewportLoaded(self: *Self) !void {
         if (!self.viewport_dirty) return;
+        // Prevent re-entrancy: if we're inside a callback (which happens during
+        // reloadViewport or observer callbacks), skip the reload. The caller
+        // will see the current state of the tree, which is safe to iterate.
+        if (self.in_callback) return;
         try self.reloadViewport();
     }
 
@@ -489,9 +502,13 @@ pub const View = struct {
         // (not viewport.visibleCount() which uses offset)
         const loaded_count = @min(self.viewport.height, self.reactive_tree.total_visible);
 
+        // During callbacks, viewport.first may be stale because the reactive_tree
+        // is being modified. Use visible_head directly as the source of truth.
+        const first = if (self.in_callback) self.reactive_tree.visible_head else self.viewport.first;
+
         return ItemIterator{
             .tree_iter = .{
-                .current = self.viewport.first,
+                .current = first,
                 .remaining = loaded_count,
             },
             .store = self.store,
@@ -678,6 +695,9 @@ pub const View = struct {
                 // Children already in tree, just unlinked - call expand() to re-link them
                 // Note: expand() also marks the edge as expanded
                 // Observer will emit enter/leave events
+                // Set re-entrancy guard during callback emission
+                self.in_callback = true;
+                defer self.in_callback = false;
                 self.reactive_tree.expand(node_id, edge_name);
             } else {
                 // Children not in tree - mark expanded first (needed for areChildrenVisible in setChildren)
@@ -702,6 +722,9 @@ pub const View = struct {
 
                 // Add children to reactive_tree (setChildren links into visible chain if edge expanded)
                 // Observer will emit enter/leave events
+                // Set re-entrancy guard during callback emission
+                self.in_callback = true;
+                defer self.in_callback = false;
                 try self.reactive_tree.setChildren(node_id, edge_name, children_entries.items);
             }
         } else {
@@ -734,8 +757,13 @@ pub const View = struct {
 
     /// Collapse an edge by node ID directly.
     /// This also recursively clears expansion state of all descendants.
-    /// Observer callbacks handle enter/leave events automatically.
+    /// Observer callbacks handle enter/leave events automatically via reactive_tree.collapse().
     pub fn collapseById(self: *Self, node_id: NodeId, edge_name: []const u8) void {
+        // Set re-entrancy guard during callback emission
+        // (clearDescendantExpansions and the final collapse both fire callbacks)
+        self.in_callback = true;
+        defer self.in_callback = false;
+
         // First, recursively clear expansion state of children under this edge
         self.clearDescendantExpansions(node_id, edge_name);
 
@@ -748,7 +776,9 @@ pub const View = struct {
             }
         }
 
-        self.viewport_dirty = true;
+        // Incrementally update the reactive_tree - this fires observer callbacks
+        // for leave events, keeping everything in sync without needing reloadViewport
+        self.reactive_tree.collapse(node_id, edge_name);
     }
 
     /// Emit leave event for a child node by ID and index.
@@ -775,12 +805,13 @@ pub const View = struct {
 
     /// Recursively clear expansion state of all descendants under a given edge.
     /// Uses the reactive_tree to find actual visible children (handles virtual edges correctly).
+    /// Calls reactive_tree.collapse() for each edge to fire observer callbacks incrementally.
     fn clearDescendantExpansions(self: *Self, parent_id: NodeId, edge_name: []const u8) void {
         // Get the tree node to find actual visible children
         const tree_node = self.reactive_tree.get(parent_id) orelse return;
         const edge = tree_node.getEdge(edge_name) orelse return;
 
-        // Iterate through children for this edge (using sibling chain)
+        // Iterate through children for this edge (using sibling chain - stable during collapse)
         var child = edge.head;
         while (child) |c| {
             const child_id = c.id;
@@ -799,12 +830,14 @@ pub const View = struct {
                     }
                 }
 
-                // Recursively clear each expanded edge
+                // Recursively clear each expanded edge (depth-first)
                 for (edges_to_clear[0..edge_count]) |child_edge| {
                     self.clearDescendantExpansions(child_id, child_edge);
+                    // Collapse in reactive_tree to fire observer callbacks
+                    self.reactive_tree.collapse(child_id, child_edge);
                 }
 
-                // Clear this child's expansion state
+                // Clear this child's expansion state from our tracking map
                 child_edges.deinit(self.allocator);
                 _ = self.expanded_nodes.remove(child_id);
             }
