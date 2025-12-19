@@ -1098,6 +1098,7 @@ fn treeCollapse(lua: *Lua) i32 {
     const h = lua.toUserdata(*TreeHandle, 1) catch return luaErr(lua, "Invalid tree");
     const id: neograph.NodeId = @intCast(lua.toInteger(2) catch return luaErr(lua, "Node ID required"));
     const edge = lua.toString(3) catch return luaErr(lua, "Edge name required");
+
     h.*.view.collapseById(id, edge);
     lua.pushBoolean(true);
     return 1;

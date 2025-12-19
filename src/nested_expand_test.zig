@@ -712,3 +712,275 @@ test "5.3 items linked before expand appear after virtual edge expansion" {
     try testing.expect(viewContains(&view, item));
     try testing.expect(!viewContains(&view, session)); // Session should NOT be visible
 }
+
+test "5.4 virtual edge collapse hides nested children" {
+    const schema = try createNestedSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    const container = try g.insert("Parent");
+    try g.update(container, .{ .name = "container" });
+
+    const session = try g.insert("Child");
+    try g.update(session, .{ .name = "session" });
+    try g.link(container, "children", session);
+
+    const item1 = try g.insert("Item");
+    try g.update(item1, .{ .name = "i1" });
+    try g.link(session, "items", item1);
+
+    const item2 = try g.insert("Item");
+    try g.update(item2, .{ .name = "i2" });
+    try g.link(session, "items", item2);
+
+    var view = try g.view(.{
+        .root = "Parent",
+        .sort = &.{"name"},
+        .edges = &.{
+            .{ .name = "children", .virtual = true, .edges = &.{
+                .{ .name = "items", .sort = &.{"name"} },
+            } },
+        },
+    }, .{ .limit = 100 });
+    defer view.deinit();
+    view.activate(false);
+
+    // Load and expand
+    _ = viewCount(&view);
+    try view.expandById(container, "children");
+    try testing.expectEqual(@as(usize, 3), viewCount(&view)); // container + 2 items
+
+    // Collapse - should hide items
+    view.collapseById(container, "children");
+    try testing.expectEqual(@as(usize, 1), viewCount(&view)); // only container
+}
+
+// ============================================================================
+// Schema for back-reference virtual hop test (matches bug_virtual_hop.lua)
+// Pattern: Debugger -> Session -> Stdio -> (virtual) session -> outputs
+// ============================================================================
+
+fn createBackRefSchema(allocator: Allocator) !Schema {
+    return parseSchema(allocator,
+        \\{
+        \\  "types": [
+        \\    {
+        \\      "name": "Debugger",
+        \\      "properties": [{ "name": "name", "type": "string" }],
+        \\      "edges": [{ "name": "sessions", "target": "Session", "reverse": "debugger" }],
+        \\      "indexes": [{ "fields": [{ "field": "name", "direction": "asc" }] }]
+        \\    },
+        \\    {
+        \\      "name": "Session",
+        \\      "properties": [{ "name": "name", "type": "string" }],
+        \\      "edges": [
+        \\        { "name": "debugger", "target": "Debugger", "reverse": "sessions" },
+        \\        { "name": "stdio", "target": "Stdio", "reverse": "session" },
+        \\        { "name": "outputs", "target": "Output", "reverse": "session" }
+        \\      ],
+        \\      "indexes": [{ "fields": [{ "field": "name", "direction": "asc" }] }]
+        \\    },
+        \\    {
+        \\      "name": "Stdio",
+        \\      "properties": [{ "name": "name", "type": "string" }],
+        \\      "edges": [{ "name": "session", "target": "Session", "reverse": "stdio" }],
+        \\      "indexes": [{ "fields": [{ "field": "name", "direction": "asc" }] }]
+        \\    },
+        \\    {
+        \\      "name": "Output",
+        \\      "properties": [{ "name": "text", "type": "string" }],
+        \\      "edges": [{ "name": "session", "target": "Session", "reverse": "outputs" }],
+        \\      "indexes": [{ "fields": [{ "field": "text", "direction": "asc" }] }]
+        \\    }
+        \\  ]
+        \\}
+    ) catch return error.InvalidJson;
+}
+
+test "5.5 virtual hop through back-reference with collapse" {
+    // Reproduces bug_virtual_hop.lua crash
+    // Pattern: Debugger -> Session -> Stdio -> (virtual) session -> outputs
+    const schema = try createBackRefSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    // Setup: Debugger -> Session -> Stdio, Session -> 2 Outputs
+    const debugger = try g.insert("Debugger");
+    try g.update(debugger, .{ .name = "dbg" });
+
+    const session = try g.insert("Session");
+    try g.update(session, .{ .name = "sess" });
+    try g.link(debugger, "sessions", session);
+
+    const stdio = try g.insert("Stdio");
+    try g.update(stdio, .{ .name = "stdio" });
+    try g.link(session, "stdio", stdio);
+
+    const output1 = try g.insert("Output");
+    try g.update(output1, .{ .text = "Hello" });
+    try g.link(session, "outputs", output1);
+
+    const output2 = try g.insert("Output");
+    try g.update(output2, .{ .text = "World" });
+    try g.link(session, "outputs", output2);
+
+    // Query with virtual hop on back-reference edge
+    // Stdio -> session (back to Session) -> outputs
+    var view = try g.view(.{
+        .root = "Debugger",
+        .id = debugger,
+        .sort = &.{"name"},
+        .edges = &.{
+            .{ .name = "sessions", .sort = &.{"name"}, .edges = &.{
+                .{ .name = "stdio", .sort = &.{"name"}, .edges = &.{
+                    .{ .name = "session", .virtual = true, .edges = &.{
+                        .{ .name = "outputs", .sort = &.{"text"} },
+                    } },
+                } },
+            } },
+        },
+    }, .{ .limit = 100 });
+    defer view.deinit();
+    view.activate(false);
+
+    // Load and expand path
+    _ = viewCount(&view);
+    try view.expandById(debugger, "sessions");
+    try view.expandById(session, "stdio");
+    try view.expandById(stdio, "session"); // Virtual hop
+
+    // Should have: Debugger + Session + Stdio + 2 Outputs = 5
+    try testing.expectEqual(@as(usize, 5), viewCount(&view));
+    try testing.expect(viewContains(&view, output1));
+    try testing.expect(viewContains(&view, output2));
+
+    // Collapse virtual hop - should not crash
+    view.collapseById(stdio, "session");
+
+    // Should have: Debugger + Session + Stdio = 3
+    try testing.expectEqual(@as(usize, 3), viewCount(&view));
+    try testing.expect(!viewContains(&view, output1));
+    try testing.expect(!viewContains(&view, output2));
+}
+
+test "5.6 virtual hop back-ref without sort keys (matches Lua test exactly)" {
+    // Same as 5.5 but without sort keys to match Lua test
+    const schema = try createBackRefSchema(testing.allocator);
+    const g = try Graph.init(testing.allocator, schema);
+    defer g.deinit();
+
+    const debugger = try g.insert("Debugger");
+    try g.update(debugger, .{ .name = "dbg" });
+
+    const session = try g.insert("Session");
+    try g.update(session, .{ .name = "sess" });
+    try g.link(debugger, "sessions", session);
+
+    const stdio = try g.insert("Stdio");
+    try g.update(stdio, .{ .name = "stdio" });
+    try g.link(session, "stdio", stdio);
+
+    const output1 = try g.insert("Output");
+    try g.update(output1, .{ .text = "Hello" });
+    try g.link(session, "outputs", output1);
+
+    const output2 = try g.insert("Output");
+    try g.update(output2, .{ .text = "World" });
+    try g.link(session, "outputs", output2);
+
+    // Query without sort keys (matches Lua test)
+    var view = try g.view(.{
+        .root = "Debugger",
+        .id = debugger,
+        .edges = &.{
+            .{ .name = "sessions", .edges = &.{
+                .{ .name = "stdio", .edges = &.{
+                    .{ .name = "session", .virtual = true, .edges = &.{
+                        .{ .name = "outputs" },
+                    } },
+                } },
+            } },
+        },
+    }, .{ .limit = 100 });
+    defer view.deinit();
+    view.activate(false);
+
+    // Load and expand path
+    _ = viewCount(&view);
+    try view.expandById(debugger, "sessions");
+    try view.expandById(session, "stdio");
+    try view.expandById(stdio, "session");
+
+    try testing.expectEqual(@as(usize, 5), viewCount(&view));
+
+    // Collapse virtual hop - should not crash
+    view.collapseById(stdio, "session");
+
+    try testing.expectEqual(@as(usize, 3), viewCount(&view));
+}
+
+test "5.7 virtual hop back-ref with page_allocator (matches Lua exactly)" {
+    // Use page_allocator like Lua does
+    const allocator = std.heap.page_allocator;
+
+    const schema = try createBackRefSchema(allocator);
+    // Note: Schema's internal strings are managed by Graph, freed on deinit
+
+    const g = try Graph.init(allocator, schema);
+    defer g.deinit();
+
+    const debugger = try g.insert("Debugger");
+    try g.update(debugger, .{ .name = "dbg" });
+
+    const session = try g.insert("Session");
+    try g.update(session, .{ .name = "sess" });
+    try g.link(debugger, "sessions", session);
+
+    const stdio = try g.insert("Stdio");
+    try g.update(stdio, .{ .name = "stdio" });
+    try g.link(session, "stdio", stdio);
+
+    const output1 = try g.insert("Output");
+    try g.update(output1, .{ .text = "Hello" });
+    try g.link(session, "outputs", output1);
+
+    const output2 = try g.insert("Output");
+    try g.update(output2, .{ .text = "World" });
+    try g.link(session, "outputs", output2);
+
+    // Use viewFromJson like Lua does
+    const query_json =
+        \\{
+        \\  "root": "Debugger",
+        \\  "id": 1,
+        \\  "edges": [{
+        \\    "name": "sessions",
+        \\    "edges": [{
+        \\      "name": "stdio",
+        \\      "edges": [{
+        \\        "name": "session",
+        \\        "virtual": true,
+        \\        "edges": [{ "name": "outputs" }]
+        \\      }]
+        \\    }]
+        \\  }]
+        \\}
+    ;
+
+    var view = try g.viewFromJson(query_json, .{ .limit = 100 });
+    defer view.deinit();
+    view.activate(false);
+
+    // Load and expand path
+    _ = viewCount(&view);
+    try view.expandById(debugger, "sessions");
+    try view.expandById(session, "stdio");
+    try view.expandById(stdio, "session");
+
+    try testing.expectEqual(@as(usize, 5), viewCount(&view));
+
+    // Collapse virtual hop - should not crash
+    view.collapseById(stdio, "session");
+
+    try testing.expectEqual(@as(usize, 3), viewCount(&view));
+}

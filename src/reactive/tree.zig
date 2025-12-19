@@ -742,25 +742,13 @@ pub const View = struct {
         // Remove this specific edge from expanded state
         if (self.expanded_nodes.getPtr(node_id)) |node_edges| {
             _ = node_edges.edges.remove(edge_name);
-
-            // If no more edges expanded, remove the node entry entirely
             if (node_edges.edges.count() == 0) {
                 node_edges.deinit(self.allocator);
                 _ = self.expanded_nodes.remove(node_id);
             }
         }
 
-        // Collapse in reactive_tree - observer handles enter/leave events
-        if (self.reactive_tree.get(node_id)) |parent| {
-            if (parent.isExpanded(edge_name)) {
-                // Collapse in reactive_tree (unlinks children from visible chain, keeps them in tree)
-                // Observer will emit leave events before unlink, and enter events after for scroll-in
-                self.reactive_tree.collapse(node_id, edge_name);
-            }
-        } else {
-            // Parent not in tree - mark viewport dirty for full reload
-            self.viewport_dirty = true;
-        }
+        self.viewport_dirty = true;
     }
 
     /// Emit leave event for a child node by ID and index.
@@ -786,16 +774,19 @@ pub const View = struct {
     }
 
     /// Recursively clear expansion state of all descendants under a given edge.
+    /// Uses the reactive_tree to find actual visible children (handles virtual edges correctly).
     fn clearDescendantExpansions(self: *Self, parent_id: NodeId, edge_name: []const u8) void {
-        // Get children from store
-        const parent_node = self.store.get(parent_id) orelse return;
+        // Get the tree node to find actual visible children
+        const tree_node = self.reactive_tree.get(parent_id) orelse return;
+        const edge = tree_node.getEdge(edge_name) orelse return;
 
-        // Resolve edge name to edge id
-        const edge_def = self.schema.getEdgeDef(parent_node.type_id, edge_name) orelse return;
-        const children = parent_node.getEdgeTargets(edge_def.id);
+        // Iterate through children for this edge (using sibling chain)
+        var child = edge.head;
+        while (child) |c| {
+            const child_id = c.id;
+            child = c.next_sibling;
 
-        for (children) |child_id| {
-            // Recursively clear this child's expansions first
+            // Recursively clear this child's expansions
             if (self.expanded_nodes.getPtr(child_id)) |child_edges| {
                 // Collect edge names to iterate (can't modify while iterating)
                 var edges_to_clear: [16][]const u8 = undefined;

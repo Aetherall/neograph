@@ -1146,9 +1146,6 @@ pub const ChangeTracker = struct {
         errdefer loaded_children.deinit(self.allocator);
 
         for (targets) |target_id| {
-            // Skip if already in result set
-            if (sub.result_set.contains(target_id)) continue;
-
             const target = self.store.get(target_id) orelse continue;
 
             // Apply edge selection filters (empty filters = no filtering)
@@ -1159,7 +1156,9 @@ pub const ChangeTracker = struct {
             appendSortKey(&key, target, sorts);
 
             if (is_virtual) {
-                // Virtual child - add to virtual index
+                // Virtual child - add to virtual index (even if already visible elsewhere)
+                // Don't skip based on result_set - we need to load nested children through virtual hops
+                // even when the target is already visible via another path
                 try self.virtual_to_subs.add(target_id, sub);
 
                 // Also load nested children through the virtual node
@@ -1176,6 +1175,9 @@ pub const ChangeTracker = struct {
                     try self.loadNestedVisibleChildren(sub, target, sel.selections, key, &ancestry, &virtual_ancestry, edge_name, &loaded_children);
                 }
             } else {
+                // Skip visible children that are already in result set
+                if (sub.result_set.contains(target_id)) continue;
+
                 // Visible child - add to result set with edge_name for tracking
                 const owned_ancestry = try self.allocator.dupe(NodeId, ancestry.items);
                 _ = try sub.result_set.insertSortedWithEdge(target_id, key, owned_ancestry, edge_name);
